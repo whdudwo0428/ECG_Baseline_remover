@@ -56,6 +56,26 @@ def _onepole(sig, fc, fs):
         y[i] = y[i-1] + beta*(sig[i] - y[i-1])
     return y
 
+def remove_baseline_drift(y, fs, cutoff=0.5, order=4):
+    """
+    하이패스(≤cutoff Hz 제거)로 드리프트를 제거하여 0선 기준으로 고정.
+    zero-phase 적용, 출력은 평균 0으로 재중심화.
+    """
+    y = np.asarray(y, float)
+    if y.size == 0 or fs <= 0:
+        return y
+    try:
+        from scipy.signal import butter, sosfiltfilt
+        wn = float(cutoff) / max(1e-12, fs * 0.5)
+        wn = min(max(wn, 1e-6), 0.999999)
+        sos = butter(int(order), wn, btype='highpass', output='sos')
+        z = sosfiltfilt(sos, y)
+    except Exception:
+        # 폴백: 느린 1차 로우패스를 빼는 방식
+        z = y - _onepole(y, fc=cutoff, fs=fs)
+    z = z - float(np.nanmean(z))
+    return z
+
 # =========================
 # Baseline core deps
 # =========================
@@ -231,8 +251,222 @@ def baseline_hybrid_plus_adaptive(
     resid = x - b_slow
     off = median_filter(resid, size=clamp_w, mode='nearest')
     b_final = b_slow + off
+<<<<<<< Updated upstream
     y_corr = x - b_final
     return y_corr, b_final
+=======
+    y_corr = x - b_final
+    return y_corr, b_final
+
+# 원래 λ 의존(노이즈↑→λ↓)을 유지한 비교용 함수
+def baseline_hybrid_plus_adaptive_original(
+    y, fs,
+    per_win_s=2.8, per_q=15,
+    asls_lam=1e8, asls_p=0.01, asls_decim=12,
+    qrs_aware=True, verylow_fc=0.03, clamp_win_s=6.0,
+    vol_win_s=0.6, vol_gain=6.0, lam_floor_ratio=0.03,
+    hard_cut=True, break_pad_s=0.30
+):
+    from scipy.ndimage import percentile_filter, median_filter
+
+    x = np.asarray(y, float); N = x.size
+    if N < 8:
+        return np.zeros_like(x), np.zeros_like(x)
+
+    # 0) 초기 퍼센타일 바닥선
+    w = max(3, int(round(per_win_s * fs)));  w += (w % 2 == 0)
+    dc = np.median(x[np.isfinite(x)])
+    x0 = x - dc
+    b0 = percentile_filter(x0, percentile=per_q, size=w, mode='nearest')
+
+    # 1) QRS-aware + 변화점 보호
+    try:
+        base_mask = make_qrs_mask(x, fs=fs) if qrs_aware else np.ones_like(x, bool)
+    except Exception:
+        base_mask = np.ones_like(x, bool)
+    brks = _find_breaks(x, fs, k=6.5, min_gap_s=0.25)
+    prot = np.zeros_like(x, bool)
+    if len(brks) > 0:
+        prot[brks] = True
+        prot = _dilate_mask(prot, fs, pad_s=max(0.35, break_pad_s))
+        base_mask = base_mask & (~prot)
+
+    # 2) 위치별 λ 설계 (gradient + volatility)
+    grad = np.gradient(x)
+    g_ref = np.percentile(np.abs(grad), 95) + 1e-6
+    z_grad = np.clip(np.abs(grad) / g_ref, 0, 6.0)
+    lam_grad = asls_lam / (1.0 + 8.0 * z_grad)
+
+    vw = max(5, int(round(vol_win_s * fs)));  vw += (vw % 2 == 0)
+    k = np.ones(vw, float)
+    s1 = np.convolve(x, k, mode='same'); s2 = np.convolve(x*x, k, mode='same')
+    m = s1 / vw; v = s2 / vw - m*m; v[v < 0] = 0.0
+    rs = np.sqrt(v)
+    rs_ref = np.percentile(rs, 90) + 1e-9
+    z_vol = np.clip(rs / rs_ref, 0, 10.0)
+    lam_vol = asls_lam / (1.0 + float(vol_gain) * z_vol)
+
+    lam_local = np.minimum(lam_grad, lam_vol)
+    if len(brks) > 0:
+        tw = int(round(0.6 * fs))
+        for b in brks:
+            lo = max(0, b - tw); hi = min(N, b + tw + 1)
+            lam_local[lo:hi] = np.minimum(lam_local[lo:hi], asls_lam * max(5e-4, lam_floor_ratio*0.5))
+    lam_local = np.maximum(lam_local, asls_lam * max(5e-4, lam_floor_ratio))
+
+    # 3) 세그먼트 피팅
+    b1 = np.zeros_like(x)
+    if len(brks) == 0 or not hard_cut:
+        step = max(1, int(0.35 * fs))
+        for i in range(0, N, step):
+            j = min(N, i+step)
+            lam_i = float(np.median(lam_local[i:j]))
+            seg = x0[i:j] - b0[i:j]
+            mask_i = None if not qrs_aware else base_mask[i:j]
+            b1[i:j] = baseline_asls_masked(seg, lam=max(5e4, lam_i), p=asls_p,
+                                           niter=10, mask=mask_i, decim_for_baseline=max(1, int(asls_decim)))
+    else:
+        cuts = [0] + [int(c) for c in brks] + [N]
+        for k_i in range(len(cuts)-1):
+            s0, e0 = cuts[k_i], cuts[k_i+1]
+            if (e0 - s0) < int(0.5 * fs):
+                if k_i < len(cuts)-2: cuts[k_i+1] = e0 = cuts[k_i+2]
+                else: s0 = max(0, s0 - int(0.25 * fs))
+            s, e = s0, e0
+            lam_i = float(np.median(lam_local[s:e]))
+            seg = x0[s:e] - b0[s:e]
+            mask_i = None if not qrs_aware else base_mask[s:e]
+            b1_seg = baseline_asls_masked(seg, lam=max(3e4, lam_i), p=asls_p,
+                                          niter=10, mask=mask_i, decim_for_baseline=max(1, int(asls_decim)))
+            b1[s:e] = b1_seg
+        # 변화점 ±pad 초 로컬 리핏
+        pad = int(round(break_pad_s * fs))
+        if pad > 0:
+            from scipy.ndimage import percentile_filter as _pf, median_filter as _mf
+            for b in brks:
+                lo = max(0, b - pad); hi = min(N, b + pad + 1)
+                wloc = max(3, int(round(0.35 * fs))); wloc += (wloc % 2 == 0)
+                resid = (x0[lo:hi] - b0[lo:hi] - b1[lo:hi])
+                b_loc = _pf(resid, percentile=20, size=wloc, mode='nearest')
+                b_loc = _mf(b_loc, size=max(3, int(round(0.12*fs))), mode='nearest')
+                b1[lo:hi] += b_loc
+
+    # 4) 매우저주파 안정화 + 잔차 클램프
+    b = b0 + b1
+    b_slow = _onepole(b, verylow_fc, fs)
+    clamp_w = max(3, int(round(clamp_win_s * fs))); clamp_w += (clamp_w % 2 == 0)
+    from scipy.ndimage import median_filter
+    resid = x - b_slow
+    off = median_filter(resid, size=clamp_w, mode='nearest')
+    b_final = b_slow + off
+    y_corr = x - b_final
+    return y_corr, b_final
+
+# Version2 wrapper (optimized variant from calibration_edit.py)
+def baseline_hybrid_plus_adaptive_v2(
+    y, fs,
+    per_win_s=2.8, per_q=15,
+    asls_lam=1e8, asls_p=0.01, asls_decim=12,
+    qrs_aware=True, verylow_fc=0.03, clamp_win_s=6.0,
+    vol_win_s=0.6, vol_gain=6.0, lam_floor_ratio=0.03,
+    hard_cut=True, break_pad_s=0.30
+):
+    if _baseline_v2 is None:
+        return baseline_hybrid_plus_adaptive(
+            y, fs,
+            per_win_s=per_win_s, per_q=per_q,
+            asls_lam=asls_lam, asls_p=asls_p, asls_decim=asls_decim,
+            qrs_aware=qrs_aware, verylow_fc=verylow_fc, clamp_win_s=clamp_win_s,
+            vol_win_s=vol_win_s, vol_gain=vol_gain, lam_floor_ratio=lam_floor_ratio,
+            hard_cut=hard_cut, break_pad_s=break_pad_s
+        )
+    return _baseline_v2(
+        y, fs,
+        per_win_s=per_win_s, per_q=per_q,
+        asls_lam=asls_lam, asls_p=asls_p, asls_decim=asls_decim,
+        qrs_aware=qrs_aware, verylow_fc=verylow_fc, clamp_win_s=clamp_win_s,
+        vol_win_s=vol_win_s, vol_gain=vol_gain, lam_floor_ratio=lam_floor_ratio,
+        hard_cut=hard_cut, break_pad_s=break_pad_s
+    )
+
+def baseline_zero_drift(y, fs, cutoff=0.5, order=4):
+    """
+    간단·견고한 0-축 기준 보정기.
+    - y_corr: high-pass로 드리프트 제거된 신호(평균≈0)
+    - b_final: 추정된 드리프트(원본-보정)
+    """
+    y = np.asarray(y, float)
+    y_corr = remove_baseline_drift(y, fs=fs, cutoff=float(cutoff), order=int(order))
+    b_final = y - y_corr
+    return y_corr, b_final
+
+# 근본적 개선안: 2-타임스케일(빠른/느린) BL 추정 + 노이즈 가중 혼합
+def baseline_improved(
+    y, fs,
+    per_win_s=2.8, per_q=15,
+    asls_lam=1e8, asls_p=0.01, asls_decim=12,
+    qrs_aware=True, verylow_fc=0.03, clamp_win_s=6.0,
+    vol_win_s=0.6, vol_gain=6.0, lam_floor_ratio=0.03,
+    lam_slow_gain=10.0, hv_z_thr=1.5
+):
+    """
+    아이디어
+    - 빠른(중간 λ)과 느린(큰 λ) BL을 각각 추정 후, 변동성(z_vol)에 따라 가중 혼합.
+    - 노이즈↑(z_vol↑)일 때 느린 BL 비중↑ → 기준축 흔들림 억제.
+    - QRS/hardware noise 구간은 마스크로 피팅 영향 최소화.
+    """
+    from scipy.ndimage import percentile_filter, median_filter
+    x = np.asarray(y, float); N = x.size
+    if N < 8:
+        return np.zeros_like(x), np.zeros_like(x)
+
+    # 초기 바닥선
+    w = max(3, int(round(per_win_s * fs)));  w += (w % 2 == 0)
+    dc = np.median(x[np.isfinite(x)])
+    x0 = x - dc
+    b0 = percentile_filter(x0, percentile=per_q, size=w, mode='nearest')
+
+    # QRS 보호 마스크
+    try:
+        base_mask = make_qrs_mask(x, fs=fs) if qrs_aware else np.ones_like(x, bool)
+    except Exception:
+        base_mask = np.ones_like(x, bool)
+
+    # 변동성 측정 + HV 마스크(피팅 배제)
+    vw = max(5, int(round(vol_win_s * fs)));  vw += (vw % 2 == 0)
+    k = np.ones(vw, float)
+    s1 = np.convolve(x, k, mode='same'); s2 = np.convolve(x*x, k, mode='same')
+    m = s1 / vw; v = s2 / vw - m*m; v[v < 0] = 0.0
+    rs = np.sqrt(v)
+    rs_ref = np.percentile(rs, 90) + 1e-9
+    z_vol = np.clip(rs / rs_ref, 0, 10.0)
+    hv_mask = z_vol > float(hv_z_thr)
+    mask_fit = base_mask & (~hv_mask)
+
+    # 빠른/느린 BL 추정
+    seg = x0 - b0
+    lam_fast = float(max(5e4, asls_lam))
+    lam_slow = float(max(5e4, asls_lam * float(lam_slow_gain)))
+    b_fast = baseline_asls_masked(seg, lam=lam_fast, p=asls_p, niter=10,
+                                  mask=mask_fit, decim_for_baseline=max(1, int(asls_decim)))
+    b_slow = baseline_asls_masked(seg, lam=lam_slow, p=asls_p, niter=10,
+                                  mask=mask_fit, decim_for_baseline=max(1, int(asls_decim)))
+
+    # 혼합 가중: 노이즈↑ → 느린 BL 가중↑
+    alpha_fast = 1.0 / (1.0 + float(vol_gain) * z_vol)  # 0~1
+    alpha_fast = np.clip(alpha_fast, 0.0, 1.0)
+    b1 = alpha_fast * b_fast + (1.0 - alpha_fast) * b_slow
+
+    # 후처리(매우저주파 안정화 + 잔차 오프셋)
+    b = b0 + b1
+    b_slow2 = _onepole(b, verylow_fc, fs)
+    clamp_w = max(3, int(round(clamp_win_s * fs))); clamp_w += (clamp_w % 2 == 0)
+    resid = x - b_slow2
+    off = median_filter(resid, size=clamp_w, mode='nearest')
+    b_final = b_slow2 + off
+    y_corr = x - b_final
+    return y_corr, b_final
+>>>>>>> Stashed changes
 
 # =========================
 # Residual-based selective refit
@@ -770,6 +1004,7 @@ class ECGViewer(QtWidgets.QWidget):
         self.mask_plot.setVisible(self.cb_mask.isChecked())
         self.curve_base.setVisible(self.cb_base.isChecked())
 
+<<<<<<< Updated upstream
     def recompute(self):
         # 1) Baseline — Hybrid BL++
         y_src = self.y_raw.copy()
@@ -806,6 +1041,18 @@ class ECGViewer(QtWidgets.QWidget):
 
         # === No AGC / No Glitch ===
         y_corr_eq = y_corr  # 처리 신호는 순수 BL++(+선택적 리핏) 결과
+=======
+    def recompute(self):
+        # 1) Strict zero-baseline correction
+        #    - corrected는 항상 0선 주위 진동
+        #    - baseline(하늘색)은 드리프트 추정치
+        #    - 가공 baseline(주황)은 0선(고정 축)
+        y_src = self.y_raw.copy()
+        y_corr_eq = remove_baseline_drift(y_src, fs=FS, cutoff=0.5, order=4)
+        base     = y_src - y_corr_eq
+        base_proc = np.zeros_like(base)
+        resrefit_mask = np.zeros_like(y_corr_eq, dtype=bool)
+>>>>>>> Stashed changes
 
         # 2) Masks on processed signal
         sag_mask = suppress_negative_sag(
