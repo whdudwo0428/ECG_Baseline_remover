@@ -4,15 +4,104 @@
 # Masks(Sag/Step/Corner/Burst/Wave/HV)는 PROCESSED 신호(y_corr_eq=y_corr) 기준. 보간 없음.
 
 import json, sys
+from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
+from time import perf_counter
+
 import numpy as np
 from PyQt5 import QtWidgets, QtCore
 try:
     # version2 optimized baseline (from calibration_edit.py)
-    from calibration_edit import baseline_hybrid_plus_adaptive as _baseline_v2
+    from calibration_spicyyeol import baseline_hybrid_plus_adaptive as _baseline_v2
 except Exception:
     _baseline_v2 = None
 import pyqtgraph as pg
+from scipy.linalg import solveh_banded
+
+# =========================
+# Profiling utilities (borrowed from calibration_spicyyeol)
+# =========================
+_PROF = defaultdict(lambda: {"calls": 0, "total": 0.0})
+
+
+class time_block:
+    """Measure a scoped block of code."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self._t0 = None
+
+    def __enter__(self):
+        self._t0 = perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        _prof_add(self.name, perf_counter() - self._t0)
+
+
+def _prof_add(name: str, dt: float) -> None:
+    bucket = _PROF[name]
+    bucket["calls"] += 1
+    bucket["total"] += float(dt)
+
+
+def profiled(name: str = None):
+    """Decorator to accumulate execution time for hot functions."""
+
+    def deco(fn):
+        label = name or fn.__name__
+
+        def wrapped(*args, **kwargs):
+            t0 = perf_counter()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _prof_add(label, perf_counter() - t0)
+
+        wrapped.__name__ = fn.__name__
+        wrapped.__doc__ = fn.__doc__
+        return wrapped
+
+    return deco
+
+
+def profiler_report(topn: int = 25):
+    rows = []
+    for key, entry in _PROF.items():
+        calls = entry["calls"] or 1
+        total = entry["total"]
+        avg = total / calls
+        rows.append((key, calls, total, avg))
+    rows.sort(key=lambda item: item[2], reverse=True)
+    if not rows:
+        print("[Profiler] no entries recorded")
+        return rows
+    width = max(20, max(len(key) for key, *_ in rows[:topn]))
+    hdr = (
+        f"[Profiler] {'function'.ljust(width)} │ {'calls':>6} │ "
+        f"{'total_ms':>10} │ {'avg_ms':>10}"
+    )
+    bar = (
+        f"[Profiler] {'─'*width}─┼{'─'*7}┼{'─'*12}┼{'─'*12}"
+    )
+    print()
+    print(hdr)
+    print(bar)
+    for key, calls, total, avg in rows[:topn]:
+        print(
+            f"[Profiler] {key.ljust(width)} │ {calls:6d} │ "
+            f"{total*1000:10.2f} │ {avg*1000:10.3f}"
+        )
+    return rows
+
+
+def reset_profiler():
+    _PROF.clear()
+
+
+# ENABLE_PROFILING = "--profile" in sys.argv
+ENABLE_PROFILING = True
 
 # =========================
 # Config
@@ -26,6 +115,7 @@ if DECIM < 1: DECIM = 1
 # =========================
 # IO & Utils
 # =========================
+@profiled()
 def extract_ecg(obj):
     if isinstance(obj, dict):
         if 'ECG' in obj and isinstance(obj['ECG'], list):
@@ -39,10 +129,12 @@ def extract_ecg(obj):
             if hit is not None: return hit
     return None
 
+@profiled()
 def decimate_fir_zero_phase(x, q=4):
     from scipy.signal import decimate
     return decimate(x, q, ftype='fir', zero_phase=True)
 
+@profiled()
 def decimate_if_needed(x, decim: int):
     if decim <= 1: return x
     try:
@@ -61,6 +153,7 @@ def _onepole(sig, fc, fs):
         y[i] = y[i-1] + beta*(sig[i] - y[i-1])
     return y
 
+@profiled()
 def remove_baseline_drift(y, fs, cutoff=0.5, order=4):
     """
     하이패스(≤cutoff Hz 제거)로 드리프트를 제거하여 0선 기준으로 고정.
@@ -82,10 +175,10 @@ def remove_baseline_drift(y, fs, cutoff=0.5, order=4):
     return z
 
 # =========================
-# Baseline core deps
+# Baseline core deps (version_0 legacy)
 # =========================
-def baseline_asls_masked(y, lam=1e6, p=0.008, niter=10, mask=None,
-                         cg_tol=1e-3, cg_maxiter=200, decim_for_baseline=1):
+def _baseline_asls_masked_v0(y, lam=1e6, p=0.008, niter=10, mask=None,
+                             cg_tol=1e-3, cg_maxiter=200, decim_for_baseline=1):
     from scipy.sparse.linalg import cg, LinearOperator
     y = np.asarray(y, float); N = y.size
     if N < 3: return np.zeros_like(y)
@@ -93,8 +186,8 @@ def baseline_asls_masked(y, lam=1e6, p=0.008, niter=10, mask=None,
         q = int(decim_for_baseline)
         n = (N // q) * q
         y_head = y[:n]; y_ds = y_head.reshape(-1, q).mean(axis=1)
-        z_ds = baseline_asls_masked(y_ds, lam=lam, p=p, niter=niter, mask=None,
-                                    cg_tol=cg_tol, cg_maxiter=cg_maxiter, decim_for_baseline=1)
+        z_ds = _baseline_asls_masked_v0(y_ds, lam=lam, p=p, niter=niter, mask=None,
+                                        cg_tol=cg_tol, cg_maxiter=cg_maxiter, decim_for_baseline=1)
         idx = np.repeat(np.arange(z_ds.size), q)
         z_coarse = z_ds[idx]
         if z_coarse.size < N:
@@ -119,6 +212,90 @@ def baseline_asls_masked(y, lam=1e6, p=0.008, niter=10, mask=None,
         z = solve_once(w)
         w = p * (y > z) + (1 - p) * (y < z)
     return z
+
+
+# =========================
+# Baseline core deps (version_patch)
+# =========================
+@profiled()
+def baseline_asls_masked(y, lam=1e6, p=0.008, niter=10, mask=None,
+                         cg_tol=1e-3, cg_maxiter=200, decim_for_baseline=1,
+                         use_float32=True):
+    """Optimised ASLS solver (banded linear algebra)."""
+
+    x = np.asarray(y, np.float32 if use_float32 else np.float64)
+    N = x.size
+    if N < 3:
+        return np.zeros_like(x, dtype=np.float64)
+
+    if decim_for_baseline > 1:
+        q = int(decim_for_baseline)
+        n = (N // q) * q
+        if n < q:
+            return np.zeros_like(x, dtype=np.float64)
+        head = x[:n]
+        x_ds = head.reshape(-1, q).mean(axis=1)
+        z_ds = baseline_asls_masked(
+            x_ds, lam=lam, p=p, niter=niter, mask=None,
+            cg_tol=cg_tol, cg_maxiter=cg_maxiter, decim_for_baseline=1,
+            use_float32=use_float32
+        )
+        idx = np.repeat(np.arange(z_ds.size), q)
+        z_coarse = z_ds[idx]
+        if z_coarse.size < N:
+            z = np.empty(N, dtype=z_coarse.dtype)
+            z[:z_coarse.size] = z_coarse
+            z[z_coarse.size:] = z_coarse[-1]
+        else:
+            z = z_coarse[:N]
+        return z
+
+    dtype = np.float32 if use_float32 else np.float64
+    g = np.ones(N, dtype=dtype) if mask is None else np.where(mask, 1.0, 1e-3).astype(dtype)
+    lam = dtype.type(lam)
+
+    ab_u = np.zeros((3, N), dtype=dtype)
+    ab_u[0, 2:] = lam * 1.0
+    ab_u[1, 1:] = lam * (-4.0)
+    ab_u[2, :] = lam * 6.0
+
+    base_niter = int(niter)
+    if N < 0.5 * 250:
+        base_niter = min(base_niter, 5)
+    if N < 0.25 * 250:
+        base_niter = min(base_niter, 4)
+
+    w = np.ones(N, dtype=dtype)
+    z = np.zeros(N, dtype=dtype)
+    last_obj = None
+
+    for _ in range(base_niter):
+        wg = (w * g).astype(dtype, copy=False)
+        ab_u[2, :] = lam * 6.0 + wg
+        b = wg * x
+        z = solveh_banded(ab_u, b, lower=False, overwrite_ab=False,
+                          overwrite_b=True, check_finite=False)
+        w = p * (x > z) + (1.0 - p) * (x < z)
+
+        if last_obj is not None:
+            r = (x - z).astype(np.float64, copy=False)
+            data_term = float(np.dot((wg.astype(np.float64) * r), r))
+            d2 = np.diff(z.astype(np.float64), n=2,
+                         prepend=float(z[0]), append=float(z[-1]))
+            reg_term = float(lam) * float(np.dot(d2, d2))
+            obj = data_term + reg_term
+            if abs(last_obj - obj) <= 1e-5 * max(1.0, obj):
+                break
+            last_obj = obj
+        else:
+            r = (x - z).astype(np.float64, copy=False)
+            data_term = float(np.dot((wg.astype(np.float64) * r), r))
+            d2 = np.diff(z.astype(np.float64), n=2,
+                         prepend=float(z[0]), append=float(z[-1]))
+            reg_term = float(lam) * float(np.dot(d2, d2))
+            last_obj = data_term + reg_term
+
+    return z.astype(np.float64, copy=False)
 
 # =========================
 # Drift metric (baseline stability)
@@ -164,6 +341,7 @@ def compute_drift_metric(y_corr, b_final, fs):
         'lf_power_frac_baseline': lf_power_frac,
     }
 
+@profiled()
 def make_qrs_mask(y, fs=250, r_pad_ms=180, t_pad_start_ms=80, t_pad_end_ms=300):
     import neurokit2 as nk
     info = nk.ecg_peaks(y, sampling_rate=fs)[1]
@@ -180,6 +358,7 @@ def make_qrs_mask(y, fs=250, r_pad_ms=180, t_pad_start_ms=80, t_pad_end_ms=300):
     return mask
 
 # 변화점 탐지/마스크 팽창
+@profiled()
 def _find_breaks(y, fs, k=7.0, min_gap_s=0.30):
     dy = np.diff(y, prepend=y[0])
     med = np.median(dy); mad = np.median(np.abs(dy - med)) + 1e-12
@@ -193,6 +372,7 @@ def _find_breaks(y, fs, k=7.0, min_gap_s=0.30):
             breaks.append(int(i))
     return breaks
 
+@profiled()
 def _dilate_mask(mask, fs, pad_s=0.45):
     pad = int(round(pad_s * fs))
     if pad <= 0: return mask
@@ -200,6 +380,7 @@ def _dilate_mask(mask, fs, pad_s=0.45):
     return (np.convolve(mask.astype(int), k, mode='same') > 0)
 
 # Hybrid BL++ (adaptive λ, variance-aware, hard-cut, local refit)
+@profiled()
 def baseline_hybrid_plus_adaptive(
     y, fs,
     per_win_s=2.8, per_q=15,
@@ -270,8 +451,8 @@ def baseline_hybrid_plus_adaptive(
             lam_i = float(np.median(lam_local[i:j]))
             seg = x0[i:j] - b0[i:j]
             mask_i = None if not qrs_aware else base_mask[i:j]
-            b1[i:j] = baseline_asls_masked(seg, lam=max(5e4, lam_i), p=asls_p,
-                                           niter=10, mask=mask_i, decim_for_baseline=max(1, int(asls_decim)))
+            b1[i:j] = _baseline_asls_masked_v0(seg, lam=max(5e4, lam_i), p=asls_p,
+                                             niter=10, mask=mask_i, decim_for_baseline=max(1, int(asls_decim)))
     else:
         cuts = [0] + [int(c) for c in brks] + [N]
         for k_i in range(len(cuts)-1):
@@ -283,8 +464,8 @@ def baseline_hybrid_plus_adaptive(
             lam_i = float(np.median(lam_local[s:e]))
             seg = x0[s:e] - b0[s:e]
             mask_i = None if not qrs_aware else base_mask[s:e]
-            b1_seg = baseline_asls_masked(seg, lam=max(3e4, lam_i), p=asls_p,
-                                          niter=10, mask=mask_i, decim_for_baseline=max(1, int(asls_decim)))
+            b1_seg = _baseline_asls_masked_v0(seg, lam=max(3e4, lam_i), p=asls_p,
+                                            niter=10, mask=mask_i, decim_for_baseline=max(1, int(asls_decim)))
             b1[s:e] = b1_seg
         # 변화점 ±pad 초 로컬 리핏
         pad = int(round(break_pad_s * fs))
@@ -310,6 +491,7 @@ def baseline_hybrid_plus_adaptive(
     return y_corr, b_final
 
 # 원래 λ 의존(노이즈↑→λ↓)을 유지한 비교용 함수
+@profiled()
 def baseline_hybrid_plus_adaptive_original(
     y, fs,
     per_win_s=2.8, per_q=15,
@@ -374,8 +556,8 @@ def baseline_hybrid_plus_adaptive_original(
             lam_i = float(np.median(lam_local[i:j]))
             seg = x0[i:j] - b0[i:j]
             mask_i = None if not qrs_aware else base_mask[i:j]
-            b1[i:j] = baseline_asls_masked(seg, lam=max(5e4, lam_i), p=asls_p,
-                                           niter=10, mask=mask_i, decim_for_baseline=max(1, int(asls_decim)))
+            b1[i:j] = _baseline_asls_masked_v0(seg, lam=max(5e4, lam_i), p=asls_p,
+                                             niter=10, mask=mask_i, decim_for_baseline=max(1, int(asls_decim)))
     else:
         cuts = [0] + [int(c) for c in brks] + [N]
         for k_i in range(len(cuts)-1):
@@ -387,8 +569,8 @@ def baseline_hybrid_plus_adaptive_original(
             lam_i = float(np.median(lam_local[s:e]))
             seg = x0[s:e] - b0[s:e]
             mask_i = None if not qrs_aware else base_mask[s:e]
-            b1_seg = baseline_asls_masked(seg, lam=max(3e4, lam_i), p=asls_p,
-                                          niter=10, mask=mask_i, decim_for_baseline=max(1, int(asls_decim)))
+            b1_seg = _baseline_asls_masked_v0(seg, lam=max(3e4, lam_i), p=asls_p,
+                                            niter=10, mask=mask_i, decim_for_baseline=max(1, int(asls_decim)))
             b1[s:e] = b1_seg
         # 변화점 ±pad 초 로컬 리핏
         pad = int(round(break_pad_s * fs))
@@ -451,7 +633,9 @@ def baseline_zero_drift(y, fs, cutoff=0.5, order=4):
     b_final = y - y_corr
     return y_corr, b_final
 
+
 # 근본적 개선안: 2-타임스케일(빠른/느린) BL 추정 + 노이즈 가중 혼합
+@profiled()
 def baseline_improved(
     y, fs,
     per_win_s=2.8, per_q=15,
@@ -517,6 +701,24 @@ def baseline_improved(
     b_final = b_slow2 + off
     y_corr = x - b_final
     return y_corr, b_final
+
+# =========================
+# Baseline algorithm registry
+# =========================
+VERSION_LIBRARY = {
+    "version_0": {
+        "baseline_asls_masked": _baseline_asls_masked_v0,
+        "baseline_hybrid_plus_adaptive": baseline_hybrid_plus_adaptive_original,
+        "baseline_zero_drift": baseline_zero_drift,
+    },
+    "version_patch": {
+        "baseline_asls_masked": baseline_asls_masked,
+        "baseline_hybrid_plus_adaptive": baseline_hybrid_plus_adaptive,
+        "baseline_hybrid_plus_adaptive_v2": baseline_hybrid_plus_adaptive_v2,
+        "baseline_improved": baseline_improved,
+        "baseline_zero_drift": baseline_zero_drift,
+    },
+}
 
 # =========================
 # Residual-based selective refit
@@ -593,6 +795,7 @@ def selective_residual_refit(y_src, base_in, fs,
 # =========================
 # Masks (computed on processed signal)
 # =========================
+@profiled()
 def suppress_negative_sag(y, fs, win_sec=1.0, q_floor=20, k_neg=3.5,
                           min_dur_s=0.25, pad_s=0.25, protect_qrs=True):
     from scipy.ndimage import percentile_filter
@@ -627,6 +830,7 @@ def suppress_negative_sag(y, fs, win_sec=1.0, q_floor=20, k_neg=3.5,
         else: i += 1
     return out
 
+@profiled()
 def fix_downward_steps_mask(y, fs, pre_s=0.5, post_s=0.5, gap_s=0.08,
                             amp_sigma=5.0, amp_abs=None, min_hold_s=0.45,
                             refractory_s=0.80, protect_qrs=True):
@@ -666,6 +870,7 @@ def fix_downward_steps_mask(y, fs, pre_s=0.5, post_s=0.5, gap_s=0.08,
         last_end = hold_end
     return mask
 
+@profiled()
 def smooth_corners_mask(y, fs, L_ms=140, k_sigma=5.5, protect_qrs=True):
     y = np.asarray(y, float); N = y.size
     if N < 10: return np.zeros(N, bool)
@@ -695,12 +900,14 @@ def smooth_corners_mask(y, fs, L_ms=140, k_sigma=5.5, protect_qrs=True):
         mask[a:b] = True
     return mask
 
+@profiled()
 def rolling_std_fast(y: np.ndarray, w: int) -> np.ndarray:
     y = y.astype(float); k = np.ones(int(w), float)
     s1 = np.convolve(y, k, mode='same'); s2 = np.convolve(y*y, k, mode='same')
     m = s1 / int(w); v = s2 / w - m*m; v[v < 0] = 0.0
     return np.sqrt(v)
 
+@profiled()
 def high_variance_mask(y: np.ndarray, win=2000, k_sigma=5.0, pad=125):
     x = y.astype(float)
     rs = rolling_std_fast(x, max(2,int(win)))
@@ -718,12 +925,14 @@ def high_variance_mask(y: np.ndarray, win=2000, k_sigma=5.0, pad=125):
     }
     return mask, stats
 
+@profiled()
 def _smooth_binary(mask: np.ndarray, fs: float, blend_ms: int = 80) -> np.ndarray:
     L = max(3, int(round(blend_ms/1000.0 * fs)))
     if L % 2 == 0: L += 1
     win = np.hanning(L); win = win / win.sum()
     return np.convolve(mask.astype(float), win, mode='same')
 
+@profiled()
 def qrs_aware_wavelet_denoise(y, fs, wavelet='db6', level=None, sigma_scale=2.8, blend_ms=80):
     y = np.asarray(y, float); N = y.size
     try:
@@ -748,6 +957,7 @@ def qrs_aware_wavelet_denoise(y, fs, wavelet='db6', level=None, sigma_scale=2.8,
         y_w = savgol_filter(y, window_length=win, polyorder=2, mode='interp')
     return alpha * y_w + (1.0 - alpha) * y, alpha
 
+@profiled()
 def burst_mask(y, fs, win_ms=140, k_diff=7.5, k_std=3.5, pad_ms=80, protect_qrs=True):
     """버스트성 급변/분산 상승 마스크"""
     y = np.asarray(y, float); N = y.size
@@ -811,6 +1021,7 @@ class ECGViewer(QtWidgets.QWidget):
         super().__init__(parent)
         self.t = t; self.y_raw = y_raw
         self._recompute_timer = None
+        self._cache = {}
 
         root = QtWidgets.QVBoxLayout(self)
 
@@ -932,59 +1143,97 @@ class ECGViewer(QtWidgets.QWidget):
         self.curve_base_proc.setVisible(self.cb_base_proc.isChecked())
 
     def recompute(self):
-        # 1) Strict zero-baseline correction
-        #    - corrected는 항상 0선 주위 진동
-        #    - baseline(하늘색)은 드리프트 추정치
-        #    - 가공 baseline(주황)은 0선(고정 축)
-        y_src = self.y_raw.copy()
-        y_corr_eq = remove_baseline_drift(y_src, fs=FS, cutoff=0.5, order=4)
-        base     = y_src - y_corr_eq
-        base_proc = np.zeros_like(base)
-        resrefit_mask = np.zeros_like(y_corr_eq, dtype=bool)
+        if ENABLE_PROFILING:
+            reset_profiler()
+        timer_ctx = time_block("viewer_recompute") if ENABLE_PROFILING else nullcontext()
+        with timer_ctx:
+            # 1) Strict zero-baseline correction
+            #    - corrected는 항상 0선 주위 진동
+            #    - baseline(하늘색)은 드리프트 추정치
+            #    - 가공 baseline(주황)은 0선(고정 축)
+            y_src = self.y_raw.copy()
+            y_corr_eq = remove_baseline_drift(y_src, fs=FS, cutoff=0.5, order=4)
+            base = y_src - y_corr_eq
+            if self.cb_base_proc.isChecked():
+                if ENABLE_PROFILING:
+                    ctx = time_block("baseline_proc")
+                else:
+                    ctx = nullcontext()
+                with ctx:
+                    y_corr_h, _ = baseline_hybrid_plus_adaptive_v2(
+                        y_src, FS,
+                        per_win_s=2.8, per_q=15,
+                        asls_lam=1e8, asls_p=0.01, asls_decim=12,
+                        qrs_aware=True, verylow_fc=0.03, clamp_win_s=6.0,
+                        vol_win_s=0.6, vol_gain=6.0, lam_floor_ratio=0.03,
+                        hard_cut=True, break_pad_s=0.30,
+                    )
+                base_proc = y_corr_eq - np.asarray(y_corr_h, float)
+                base_proc -= float(np.nanmean(base_proc))
+            else:
+                base_proc = np.zeros_like(y_corr_eq)
+            resrefit_mask = np.zeros_like(y_corr_eq, dtype=bool)
 
-        # 2) Masks on processed signal
-        # 2) Masks on processed signal (use fixed defaults, always shown when 패널 ON)
-        sag_mask = suppress_negative_sag(y_corr_eq, FS, win_sec=1.0, q_floor=20, k_neg=3.5, min_dur_s=0.25, pad_s=0.25, protect_qrs=True)
-        step_mask = fix_downward_steps_mask(y_corr_eq, FS, amp_sigma=5.0, amp_abs=None, min_hold_s=0.45, protect_qrs=True)
-        corner_mask = smooth_corners_mask(y_corr_eq, FS, L_ms=140, k_sigma=5.5, protect_qrs=True)
-        b_mask = burst_mask(y_corr_eq, FS, win_ms=140, k_diff=7.5, k_std=3.5, pad_ms=80, protect_qrs=True)
-        _, alpha_w = qrs_aware_wavelet_denoise(y_corr_eq, FS, sigma_scale=2.8, blend_ms=80)
-        hv_mask, hv_stats = high_variance_mask(y_corr_eq, win=2000, k_sigma=5.0, pad=125)
+            # 2) Masks on processed signal (use fixed defaults, always shown when 패널 ON)
+            sag_mask = suppress_negative_sag(
+                y_corr_eq, FS, win_sec=1.0, q_floor=20, k_neg=3.5,
+                min_dur_s=0.25, pad_s=0.25, protect_qrs=True,
+            )
+            step_mask = fix_downward_steps_mask(
+                y_corr_eq, FS, amp_sigma=5.0, amp_abs=None,
+                min_hold_s=0.45, protect_qrs=True,
+            )
+            corner_mask = smooth_corners_mask(
+                y_corr_eq, FS, L_ms=140, k_sigma=5.5, protect_qrs=True,
+            )
+            b_mask = burst_mask(
+                y_corr_eq, FS, win_ms=140, k_diff=7.5, k_std=3.5,
+                pad_ms=80, protect_qrs=True,
+            )
+            _, alpha_w = qrs_aware_wavelet_denoise(
+                y_corr_eq, FS, sigma_scale=2.8, blend_ms=80,
+            )
+            hv_mask, hv_stats = high_variance_mask(
+                y_corr_eq, win=2000, k_sigma=5.0, pad=125,
+            )
 
-        # 표시 업데이트
-        self.curve_base_orig.setData(self.t, base)
-        self.curve_base_proc.setData(self.t, base_proc)
-        self.curve_corr.setData(self.t, y_corr_eq)
-        self.curve_raw.setData(self.t, self.y_raw)
+            # 표시 업데이트
+            self.curve_base_orig.setData(self.t, base)
+            self.curve_base_proc.setData(self.t, base_proc)
+            self.curve_corr.setData(self.t, y_corr_eq)
+            self.curve_raw.setData(self.t, self.y_raw)
 
-        # 마스크 패널
-        self.hv_curve.setData(self.t, hv_mask.astype(int))
-        self.sag_curve.setData(self.t, sag_mask.astype(int))
-        self.step_curve.setData(self.t, step_mask.astype(int))
-        self.corner_curve.setData(self.t, corner_mask.astype(int))
-        self.burst_curve.setData(self.t, b_mask.astype(int))
-        self.wave_curve.setData(self.t, (alpha_w > 0.5).astype(int))
-        self.resrefit_curve.setData(self.t, resrefit_mask.astype(int))
+            # 마스크 패널
+            self.hv_curve.setData(self.t, hv_mask.astype(int))
+            self.sag_curve.setData(self.t, sag_mask.astype(int))
+            self.step_curve.setData(self.t, step_mask.astype(int))
+            self.corner_curve.setData(self.t, corner_mask.astype(int))
+            self.burst_curve.setData(self.t, b_mask.astype(int))
+            self.wave_curve.setData(self.t, (alpha_w > 0.5).astype(int))
+            self.resrefit_curve.setData(self.t, resrefit_mask.astype(int))
 
-        txt = (
-            f"HV removed={int(hv_mask.sum())} ({100*hv_mask.mean():.2f}%) | "
-            f"kept={len(y_corr_eq)-int(hv_mask.sum())} | ratio={(1-hv_mask.mean()):.3f}"
-        )
-        self.mask_plot.setTitle(txt)
+            txt = (
+                f"HV removed={int(hv_mask.sum())} ({100*hv_mask.mean():.2f}%) | "
+                f"kept={len(y_corr_eq)-int(hv_mask.sum())} | ratio={(1-hv_mask.mean()):.3f}"
+            )
+            self.mask_plot.setTitle(txt)
 
-        self.update_visibility()
+            self.update_visibility()
 
-        lo, hi = self.region.getRegion()
-        self.plot.setXRange(lo, hi, padding=0)
+            lo, hi = self.region.getRegion()
+            self.plot.setXRange(lo, hi, padding=0)
 
-        # 자동 Y스케일: 가시 구간 기반으로 margin 포함하여 설정
-        vis_idx = (self.t >= lo) & (self.t <= hi)
-        if np.any(vis_idx):
-            y_sub = self.y_raw[vis_idx]
-            ymin, ymax = float(np.min(y_sub)), float(np.max(y_sub))
-            if np.isfinite(ymin) and np.isfinite(ymax) and ymax > ymin:
-                margin = 0.1 * (ymax - ymin) if (ymax - ymin) > 0 else 1.0
-                self.plot.setYRange(ymin - margin, ymax + margin, padding=0)
+            # 자동 Y스케일: 가시 구간 기반으로 margin 포함하여 설정
+            vis_idx = (self.t >= lo) & (self.t <= hi)
+            if np.any(vis_idx):
+                y_sub = self.y_raw[vis_idx]
+                ymin, ymax = float(np.min(y_sub)), float(np.max(y_sub))
+                if np.isfinite(ymin) and np.isfinite(ymax) and ymax > ymin:
+                    margin = 0.1 * (ymax - ymin) if (ymax - ymin) > 0 else 1.0
+                    self.plot.setYRange(ymin - margin, ymax + margin, padding=0)
+
+        if ENABLE_PROFILING:
+            profiler_report(topn=25)
 
     def update_region(self):
         lo, hi = self.region.getRegion()
